@@ -1,0 +1,143 @@
+#!/usr/bin/python3
+
+import os
+import sys
+import docker
+import glob
+import shutil
+import subprocess
+import tempfile
+
+
+d = docker.APIClient()
+EXPORTS_DIR = "exports"
+HOSTFS_DIR = "hostfs"
+
+
+def get_repository_image_tag(image):
+    try:
+        repository, image = image.split("/")
+    except ValueError:
+        repository, image = "", image
+    try:
+        image, tag = image.split(":")
+    except ValueError:
+        image, tag = image, "latest"
+
+    return repository, image, tag
+
+
+class Program:
+    def __init__(self, fqin):
+        self.fqin = fqin
+        self.repository, self.image, self.tag = get_repository_image_tag(self.fqin)
+        self.repository_image = self.image
+        if self.repository:
+            self.repository_image = self.repository + "/" + self.image
+
+        self.container_name = "{}-container".format(self.image, self.tag)
+
+        self.temp_dir = tempfile.mkdtemp()
+        self.mountpoint = os.path.join(self.temp_dir, "mountpoint")
+        os.makedirs(self.mountpoint)
+        self.buildroot = os.path.join(self.temp_dir, "buildroot")
+        os.makedirs(self.buildroot)
+
+    def ensure_image_exists(self):
+        try:
+            d.inspect_image(self.fqin)
+        except docker.errors.DockerException:
+            d.pull(self.repository_image, tag=self.tag)
+
+    def copy_files(self):
+        exports_dir = os.path.join(self.mountpoint, EXPORTS_DIR)
+        hostfs_dir = os.path.join(exports_dir, HOSTFS_DIR)
+
+        # FIXME: might not exist
+        systemd_dir = os.path.join(self.buildroot, "usr/lib/systemd/system/")
+        os.makedirs(systemd_dir)
+        unit_name = "{}.service".format(self.container_name)
+        target_unitfile = os.path.join(systemd_dir, unit_name)
+
+        # FIXME: might be missing
+        source_unit_template = os.path.join(exports_dir, "service.template")
+        shutil.copy2(source_unit_template, target_unitfile)
+
+        dirs = []
+        for x in os.listdir(hostfs_dir):
+            d = os.path.join(hostfs_dir, x)
+            if os.path.isdir(d):
+                dirs.append(d)
+
+        cmd = ["cp", "-avr"] + dirs + [self.buildroot]
+        subprocess.check_call(cmd)
+
+        copied_files = []
+        for root, dirs, files in os.walk(self.buildroot):
+            for f in files:
+                fp = os.path.join(root, f)
+                print("copy {}".format(fp))
+                copied_files.append(fp)
+
+        return copied_files
+
+    def build_rpm(self, files):
+        SPEC_TEMPLATE = """\
+Name: {name}
+Version: {version}
+Release: {release}
+License: N/A
+Summary: Host files for container {container_name}.
+BuildArch: noarch
+
+%description
+%{{summary}}
+
+%files
+"""
+        spec = SPEC_TEMPLATE.format(name=self.container_name, version="1", release="1", container_name=self.container_name)
+        for f in files:
+            spec += f[len(self.buildroot):] + "\n"
+
+        spec_path = os.path.join(self.temp_dir, self.container_name + ".spec")
+        with open(spec_path, "w") as fd:
+            fd.write(spec)
+
+        rpmbuild = ['rpmbuild', '--noclean', '-bb', spec_path,
+            '--define', '_sourcedir {}'.format(self.temp_dir),
+            '--define', '_specdir {}'.format(self.temp_dir),
+            '--define', '_builddir {}'.format(self.temp_dir),
+            '--define', '_srcrpmdir {}'.format(self.temp_dir),
+            '--define', '_rpmdir {}'.format(self.temp_dir),
+             '--build-in-place', '--buildroot={}'.format(self.buildroot)]
+
+        subprocess.check_call(rpmbuild, cwd=self.temp_dir)
+        rpm_dir = os.path.join(self.temp_dir, "noarch")
+        return glob.glob(os.path.join(rpm_dir, "*.noarch.rpm"))[0]
+        # subprocess.call(["zsh", "-l"], cwd=self.mountpoint)
+
+    def do(self):
+        try:
+            self.ensure_image_exists()
+            subprocess.check_call(["atomic", "mount", self.fqin, self.mountpoint])
+            files = self.copy_files()
+            rpm_path = self.build_rpm(files)
+            subprocess.check_call(["dnf", "install", "-y", rpm_path])
+        finally:
+            subprocess.check_call(["atomic", "unmount", self.mountpoint])
+            shutil.rmtree(self.temp_dir)
+        return 0
+
+
+def main():
+    try:
+        # fully qualified image name
+        fqin = sys.argv[1]
+    except IndexError:
+        print("Usage: {} <image>".format(sys.argv[0]))
+        return 3
+
+    p = Program(fqin)
+    return p.do()
+
+sys.exit(main())
