@@ -1,0 +1,12 @@
+FROM fedora:25
+
+RUN dnf install -y git atomic
+
+RUN git clone -q --single-branch -b generate-rpm https://github.com/giuseppe/atomic
+
+ENV PYTHONPATH=/atomic/
+
+# test
+RUN python3 /atomic/atomic install --help | grep "system-package"
+
+ENTRYPOINT ["python3", "/atomic/atomic"]
